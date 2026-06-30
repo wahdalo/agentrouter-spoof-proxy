@@ -396,9 +396,11 @@ const server = http.createServer((req, res) => {
 
         let errorHandled = false;  // prevent double-invocation of handleError (timeout fires error)
         let idleTimer = null;      // SSE idle timeout
+        let reqTimer = null;       // upstream request timeout (manual, more reliable than opts.timeout)
 
         function clearIdleTimer() {
           if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+          if (reqTimer) { clearTimeout(reqTimer); reqTimer = null; }
         }
 
         const upstreamReq = UPSTREAM_MODULE.request(opts, (upstreamRes) => {
@@ -603,6 +605,16 @@ const server = http.createServer((req, res) => {
           finishProxy();
           resolveProxy();
         }
+
+        // Manual request timeout (more reliable than opts.timeout with keep-alive pool)
+        reqTimer = setTimeout(() => {
+          if (errorHandled) return;
+          errorHandled = true;
+          clearIdleTimer();
+          upstreamReq.destroy();
+          handleError(new Error("timeout"));
+        }, TIMEOUT);
+        reqTimer.unref();
 
         const rawBody = Buffer.concat(body);
         if (rawBody.length) upstreamReq.write(rawBody);
