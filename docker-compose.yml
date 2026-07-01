@@ -18,6 +18,7 @@ services:
       - RETRY_DELAY_MS=${RETRY_DELAY_MS:-1000}
       - AR_API_KEY=${AR_API_KEY:-}
       - DISCOVERY_INTERVAL_MS=${DISCOVERY_INTERVAL_MS:-600000}
+      - INJECT_SYSTEM_PROMPT=${INJECT_SYSTEM_PROMPT:-}
     sysctls:
       - net.ipv4.tcp_keepalive_time=60
       - net.ipv4.tcp_keepalive_intvl=10

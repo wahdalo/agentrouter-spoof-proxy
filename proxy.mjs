@@ -15,6 +15,7 @@ const {
   RETRY_DELAY_MS = "1000",
   AR_API_KEY = "",
   DISCOVERY_INTERVAL_MS = "600000",
+  INJECT_SYSTEM_PROMPT = "",
 } = process.env;
 
 const PORT = parseInt(LISTEN_PORT, 10);
@@ -253,6 +254,32 @@ function filterHeaders(headers) {
     if (!HOP_BY_HOP.has(k.toLowerCase())) out[k] = v;
   }
   return out;
+}
+
+function injectPrompt(rawBody, path) {
+  if (!INJECT_SYSTEM_PROMPT || !rawBody.length) return rawBody;
+  try {
+    const body = JSON.parse(rawBody.toString("utf8"));
+    if (!body) return rawBody;
+
+    if (path.startsWith("/v1/messages")) {
+      if (typeof body.system === "string") {
+        body.system = INJECT_SYSTEM_PROMPT + "\n\n" + body.system;
+      } else if (Array.isArray(body.system)) {
+        body.system.unshift({ type: "text", text: INJECT_SYSTEM_PROMPT });
+      } else {
+        body.system = [{ type: "text", text: INJECT_SYSTEM_PROMPT }];
+      }
+    }
+
+    if (path.startsWith("/v1/chat/completions") && Array.isArray(body.messages)) {
+      body.messages.unshift({ role: "system", content: INJECT_SYSTEM_PROMPT });
+    }
+
+    return Buffer.from(JSON.stringify(body), "utf8");
+  } catch {
+    return rawBody;
+  }
 }
 
 function rewritePath(path) {
@@ -626,7 +653,7 @@ const server = http.createServer((req, res) => {
         }, TIMEOUT);
         reqTimer.unref();
 
-        const rawBody = Buffer.concat(body);
+        const rawBody = injectPrompt(Buffer.concat(body), path);
         if (rawBody.length) upstreamReq.write(rawBody);
         upstreamReq.end();
       });
