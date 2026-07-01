@@ -24,11 +24,13 @@ export class MockUpstream {
 
   async start() {
     this._server = http.createServer((req, res) => {
-      this.received.push({ method: req.method, url: req.url, headers: req.headers });
-
       const body = [];
       req.on("data", (c) => body.push(c));
-      req.on("end", () => this._route(req, res, Buffer.concat(body)));
+      req.on("end", () => {
+        const rawBody = Buffer.concat(body);
+        this.received.push({ method: req.method, url: req.url, headers: req.headers, body: rawBody.length ? JSON.parse(rawBody) : null });
+        this._route(req, res, rawBody);
+      });
     });
 
     return new Promise((resolve) => {

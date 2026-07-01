@@ -1,6 +1,6 @@
 # AgentRouter Spoof Proxy
 
-A lightweight Node.js reverse proxy that injects Claude Code spoof headers and maintains WAF cookies to bypass AgentRouter restrictions. Zero dependencies, single-file, ~680 lines, 120MB Docker image.
+A lightweight Node.js reverse proxy that injects Claude Code spoof headers and maintains WAF cookies to bypass AgentRouter restrictions. Zero dependencies, single-file, ~730 lines, 120MB Docker image.
 
 ## Architecture
 
@@ -16,6 +16,7 @@ The proxy:
 - Retries on timeouts/5xx with exponential backoff
 - Circuit breaker on consecutive failures
 - Graceful shutdown with active stream draining
+- Configurable system prompt injection (`INJECT_SYSTEM_PROMPT`) for content filter bypass
 
 ## Quick Start
 
@@ -66,6 +67,7 @@ All settings have sensible defaults. Only set what you need to change.
 | `RETRY_DELAY_MS` | `1000` | Base retry delay, doubles per attempt (ms) |
 | `AR_API_KEY` | _(empty)_ | AgentRouter API key for auto model discovery |
 | `DISCOVERY_INTERVAL_MS` | `600000` | Model list refresh interval (ms) |
+| `INJECT_SYSTEM_PROMPT` | _(empty)_ | System prompt injected into every request (Anthropic `system` field / OpenAI `system` message). Empty = disabled. |
 
 ## Endpoints
 
@@ -149,6 +151,29 @@ AR_API_KEY=your-agentrouter-api-key
 The proxy queries `agentrouter.org/v1/models` on startup and every 10 minutes. The health endpoint shows `modelSource: "dynamic"` when active.
 
 Without `AR_API_KEY`, the static `MODELS_CSV` list is used. Unknown model IDs in requests are always forwarded as-is.
+
+## Prompt Injection
+
+Set `INJECT_SYSTEM_PROMPT` in your `.env` to inject a system prompt into every proxied request:
+
+```bash
+INJECT_SYSTEM_PROMPT=Your system prompt here
+```
+
+The prompt is injected differently depending on the API format:
+
+| Format | Path | Injection target |
+|--------|------|-----------------|
+| Anthropic | `/v1/messages` | `system` field (string or content block array) |
+| OpenAI | `/v1/chat/completions` | System message prepended to `messages` array |
+
+Recreate the container after changing the variable:
+
+```bash
+docker compose up -d --build
+```
+
+> **Note:** The upstream (agentrouter.org) enforces its own server-side content policies. The injected prompt may not bypass upstream filtering.
 
 ## Model Reference
 

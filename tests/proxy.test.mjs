@@ -543,4 +543,119 @@ describe("agentrouter-spoof-proxy", () => {
       }
     });
   });
+
+  // ── Prompt injection ──
+  describe("prompt injection", () => {
+    let injMock;
+    let injProxy;
+    let injPort;
+
+    const INJECT_PROMPT = "TEST_INJECTION_SYSTEM_PROMPT";
+
+    before(async () => {
+      injMock = new MockUpstream();
+      await injMock.start();
+      injPort = await getFreePort();
+      injProxy = spawn(process.execPath, ["proxy.mjs"], {
+        cwd: PROXY_DIR,
+        env: {
+          ...process.env,
+          LISTEN_PORT: String(injPort),
+          TARGET_PROTOCOL: "http",
+          TARGET_HOST: "127.0.0.1",
+          TARGET_PORT: String(injMock.port),
+          REQUEST_TIMEOUT_MS: "5000",
+          MAX_RETRIES: "1",
+          RETRY_DELAY_MS: "10",
+          WARMUP_INTERVAL_MS: "600000",
+          DISCOVERY_INTERVAL_MS: "600000",
+          INJECT_SYSTEM_PROMPT: INJECT_PROMPT,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      injProxy.stdout.on("data", () => {});
+      injProxy.stderr.on("data", () => {});
+      await waitForProxy(injPort);
+    });
+
+    after(() => {
+      if (injProxy && !injProxy.killed) injProxy.kill("SIGTERM");
+      injMock.close();
+    });
+
+    it("injects system prompt for Anthropic /v1/messages format", async () => {
+      injMock.received.length = 0;
+      await collectSse(fetchStream(`http://127.0.0.1:${injPort}/v1/messages`, {
+        method: "POST",
+        headers: proxyHeaders(),
+        body: chatBody(),
+      }));
+      const req = injMock.received.find((r) => r.method === "POST" && r.url.startsWith("/v1/messages"));
+      assert.ok(req, "upstream received POST");
+      assert.ok(req.body, "upstream body should be captured");
+      const sysOk =
+        (typeof req.body.system === "string" && req.body.system.includes(INJECT_PROMPT)) ||
+        (Array.isArray(req.body.system) && req.body.system.some((b) => b.text && b.text.includes(INJECT_PROMPT)));
+      assert.ok(sysOk, `system field should contain injected prompt, got: ${JSON.stringify(req.body.system)}`);
+    });
+
+    it("injects system prompt for Anthropic /messages format (rewritten)", async () => {
+      injMock.received.length = 0;
+      await collectSse(fetchStream(`http://127.0.0.1:${injPort}/messages`, {
+        method: "POST",
+        headers: proxyHeaders(),
+        body: chatBody(),
+      }));
+      const req = injMock.received.find((r) => r.method === "POST" && r.url.startsWith("/v1/messages"));
+      assert.ok(req, "upstream received POST");
+      const sysOk =
+        (typeof req.body.system === "string" && req.body.system.includes(INJECT_PROMPT)) ||
+        (Array.isArray(req.body.system) && req.body.system.some((b) => b.text && b.text.includes(INJECT_PROMPT)));
+      assert.ok(sysOk, `system should contain injected prompt for rewritten /messages, got: ${JSON.stringify(req.body.system)}`);
+    });
+
+    it("injects system message for OpenAI /v1/chat/completions format", async () => {
+      injMock.received.length = 0;
+      const openaiBody = JSON.stringify({
+        model: "claude-opus-4-8",
+        messages: [{ role: "user", content: "hello" }],
+        stream: true,
+        max_tokens: 10,
+      });
+      await collectSse(fetchStream(`http://127.0.0.1:${injPort}/v1/chat/completions`, {
+        method: "POST",
+        headers: { ...proxyHeaders(), "content-type": "application/json" },
+        body: openaiBody,
+      }));
+      const req = injMock.received.find((r) => r.method === "POST" && r.url.startsWith("/v1/chat/completions"));
+      assert.ok(req, "upstream received POST");
+      assert.ok(Array.isArray(req.body.messages), "messages should be an array");
+      assert.equal(req.body.messages[0].role, "system", "first message should be system role");
+      assert.ok(
+        req.body.messages[0].content.includes(INJECT_PROMPT),
+        "first message should contain injected prompt"
+      );
+    });
+
+    it("appends to existing Anthropic system field", async () => {
+      injMock.received.length = 0;
+      const bodyWithSystem = JSON.stringify({
+        model: "claude-opus-4-8",
+        messages: [{ role: "user", content: "hi" }],
+        system: "original system prompt",
+        stream: true,
+        max_tokens: 10,
+      });
+      await collectSse(fetchStream(`http://127.0.0.1:${injPort}/v1/messages`, {
+        method: "POST",
+        headers: proxyHeaders(),
+        body: bodyWithSystem,
+      }));
+      const req = injMock.received.find((r) => r.method === "POST" && r.url.startsWith("/v1/messages"));
+      assert.ok(req, "upstream received POST");
+      assert.ok(typeof req.body.system === "string", "system should be string");
+      assert.ok(req.body.system.startsWith(INJECT_PROMPT), "injected prompt should be prepended");
+      assert.ok(req.body.system.includes("original system prompt"), "original system should be preserved");
+    });
+  });
 });
