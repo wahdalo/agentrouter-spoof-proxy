@@ -151,22 +151,15 @@ async function fetchModels() {
   }
 }
 
-// ── DNS cache ──
-
-let cachedIps = [];
-let dnsExpiry = 0;
+// ── DNS resolution ──
 
 async function resolveDns() {
   const ts = new Date().toISOString();
   try {
     const addresses = await resolve4(TARGET_HOST);
-    cachedIps = addresses;
-    dnsExpiry = Date.now() + 300000;
     log(ts, `DNS resolved ${TARGET_HOST} → ${addresses.join(", ")}`);
   } catch {
-    if (!cachedIps.length) {
-      log(ts, `DNS resolution failed for ${TARGET_HOST}`);
-    }
+    log(ts, `DNS resolution failed for ${TARGET_HOST}`);
   }
 }
 
@@ -348,7 +341,6 @@ const server = http.createServer((req, res) => {
       wafCookie: !!wafCookieStr,
       circuitOpen: isCircuitOpen(),
       consecutiveFails,
-      cachedIps: cachedIps.length,
     });
     return;
   }
@@ -470,6 +462,7 @@ const server = http.createServer((req, res) => {
                 log(ts, `WAF ${statusCode} detected, refreshing cookie and retrying...`);
                 await warmup();
                 if (wafCookieStr) upstreamHeaders["Cookie"] = wafCookieStr;
+                finishProxy(); // decrement activeStreams before retry
                 const result = await doRequest(attempt + 1);
                 resolveProxy(result);
                 return;
@@ -488,8 +481,10 @@ const server = http.createServer((req, res) => {
           // Retry on 5xx
           if (isRetryable(statusCode, null) && attempt < MAX_RETRIES_NUM) {
             upstreamRes.resume();
+            errorHandled = true; // prevent concurrent timeout/error retry
             log(ts, `${method} ${rawPath} <- ${statusCode}, retrying (${attempt + 1}/${MAX_RETRIES_NUM})...`);
             const delay = RETRY_DELAY * Math.pow(2, attempt);
+            finishProxy(); // decrement activeStreams before retry
             setTimeout(async () => {
               const result = await doRequest(attempt + 1);
               resolveProxy(result);
@@ -584,7 +579,10 @@ const server = http.createServer((req, res) => {
             if (keepaliveTimer) return;
             keepaliveTimer = setInterval(() => {
               if (streamFinished || res.writableEnded) { clearInterval(keepaliveTimer); keepaliveTimer = null; return; }
-              try { res.write(":\n\n"); } catch { clearInterval(keepaliveTimer); keepaliveTimer = null; }
+              const canContinue = res.write(":\n\n");
+              if (canContinue === false && IS_DEBUG) {
+                logDebug(ts, "keepalive backpressure, skipping tick");
+              }
             }, 10000);
             keepaliveTimer.unref();
           }
@@ -772,6 +770,10 @@ const server = http.createServer((req, res) => {
     }
   });
 });
+
+// Safety: guard against slow-headers attacks
+server.headersTimeout = 30000;   // 30s to send complete request headers
+server.requestTimeout = 0;       // no limit on req body (SSE can be long)
 
 // ── Start & Graceful Shutdown ──
 
