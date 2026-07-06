@@ -1,6 +1,6 @@
 # AgentRouter Spoof Proxy
 
-A lightweight Node.js reverse proxy that injects Claude Code spoof headers and maintains WAF cookies to bypass AgentRouter restrictions. Zero dependencies, single-file, ~730 lines, 120MB Docker image.
+A lightweight Node.js reverse proxy that injects Claude Code spoof headers and maintains WAF cookies to bypass AgentRouter restrictions. Zero dependencies, single-file, ~780 lines, 120MB Docker image.
 
 ## Architecture
 
@@ -18,11 +18,17 @@ The proxy:
 - Graceful shutdown with active stream draining
 - Configurable system prompt injection (`INJECT_SYSTEM_PROMPT`) for content filter bypass
 
+---
+
 ## Quick Start
+
+### Option A — Docker Compose (recommended)
 
 ```bash
 git clone https://github.com/trefeon/agentrouter-spoof-proxy.git
 cd agentrouter-spoof-proxy
+cp .env.example .env
+# edit .env if needed (all values have sensible defaults)
 docker compose up -d --build
 ```
 
@@ -45,30 +51,126 @@ curl http://localhost:8318/health
 
 If `wafCookie` is `false`, wait a few seconds and retry — the WAF warmup runs on startup.
 
-## Configuration
+### Option B — Direct Node.js (no Docker)
 
-Copy `.env.example` to `.env` and edit as needed:
+Requires Node.js 22+.
 
 ```bash
+git clone https://github.com/trefeon/agentrouter-spoof-proxy.git
+cd agentrouter-spoof-proxy
 cp .env.example .env
+# edit .env if needed
+node proxy.mjs
 ```
 
-All settings have sensible defaults. Only set what you need to change.
+### Option C — Docker (raw, no compose)
+
+```bash
+git clone https://github.com/trefeon/agentrouter-spoof-proxy.git
+cd agentrouter-spoof-proxy
+docker build -t agentrouter-proxy .
+docker run -d \
+  --name agentrouter-proxy \
+  -p 8318:8318 \
+  --env-file .env \
+  --restart unless-stopped \
+  agentrouter-proxy
+```
+
+View logs:
+```bash
+docker logs -f agentrouter-proxy
+```
+
+### Option D — PM2 (process manager)
+
+```bash
+git clone https://github.com/trefeon/agentrouter-spoof-proxy.git
+cd agentrouter-spoof-proxy
+cp .env.example .env
+npm install -g pm2           # if not installed
+pm2 start proxy.mjs --name agentrouter-proxy
+pm2 save                     # save process list
+pm2 startup                  # auto-restart on boot
+```
+
+PM2 commands:
+```bash
+pm2 status                   # check running
+pm2 logs agentrouter-proxy   # view logs
+pm2 restart agentrouter-proxy
+pm2 stop agentrouter-proxy
+pm2 delete agentrouter-proxy
+```
+
+### Option E — systemd user service (production)
+
+Create `~/.config/systemd/user/agentrouter-proxy.service`:
+
+```ini
+[Unit]
+Description=AgentRouter Spoof Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /path/to/agentrouter-spoof-proxy/proxy.mjs
+Restart=always
+RestartSec=5
+WorkingDirectory=/path/to/agentrouter-spoof-proxy
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agentrouter-proxy
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
+```
+
+Enable and start:
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now agentrouter-proxy
+systemctl --user status agentrouter-proxy
+journalctl --user -u agentrouter-proxy -f
+```
+
+To survive reboot without user login:
+```bash
+sudo loginctl enable-linger $USER
+```
+
+---
+
+## Configuration
+
+Copy `.env.example` to `.env` and edit as needed. All settings have sensible defaults.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LISTEN_PORT` | `8318` | Proxy listen port |
+| `TARGET_PROTOCOL` | `https` | Upstream protocol (`http` or `https`) |
 | `TARGET_HOST` | `agentrouter.org` | Upstream hostname |
 | `TARGET_PORT` | `443` | Upstream port |
-| `REQUEST_TIMEOUT_MS` | `300000` | Max time to wait for upstream first byte (ms). Raised from 120s for large-context tasks. |
-| `SSE_IDLE_TIMEOUT_MS` | `600000` | SSE idle timeout: if no streaming data arrives within this window, stream is terminated (ms) |
+| `REQUEST_TIMEOUT_MS` | `300000` | Max time to wait for upstream first byte (ms) |
+| `RESPONSE_TIMEOUT_MS` | `30000` | Timeout for upstream to send response headers (ms) |
+| `SSE_IDLE_TIMEOUT_MS` | `600000` | SSE idle timeout — terminates hung streams (ms) |
+| `SSE_CHUNK_TIMEOUT_MS` | `30000` | Max time between SSE data chunks (ms) |
 | `MODELS_CSV` | `claude-opus-4-6,...` | Static model fallback list |
 | `WARMUP_INTERVAL_MS` | `180000` | WAF cookie refresh interval (ms) |
 | `MAX_RETRIES` | `2` | Retry attempts on failure |
 | `RETRY_DELAY_MS` | `1000` | Base retry delay, doubles per attempt (ms) |
 | `AR_API_KEY` | _(empty)_ | AgentRouter API key for auto model discovery |
 | `DISCOVERY_INTERVAL_MS` | `600000` | Model list refresh interval (ms) |
-| `INJECT_SYSTEM_PROMPT` | _(empty)_ | System prompt injected into every request (Anthropic `system` field / OpenAI `system` message). Empty = disabled. |
+| `INJECT_SYSTEM_PROMPT` | _(empty)_ | System prompt injected into every request (empty = disabled) |
+| `LOG_LEVEL` | `info` | `info` or `debug` |
+
+---
 
 ## Endpoints
 
@@ -80,11 +182,11 @@ All settings have sensible defaults. Only set what you need to change.
 | `/messages` | POST | Rewritten to `/v1/messages`, then proxied |
 | `/v1/chat/completions` | POST | Proxied to upstream (pass-through) |
 
+---
+
 ## Usage
 
-### Standalone (direct requests)
-
-Send Anthropic-format requests directly:
+### Direct requests
 
 ```bash
 curl http://localhost:8318/v1/messages \
@@ -103,24 +205,26 @@ curl http://localhost:8318/v1/messages \
 If your router runs in Docker, both containers need to be on the same network:
 
 ```bash
-# Option A: copy and edit the override example
+# Option A: use docker-compose.override.yml
 cp docker-compose.override.yml.example docker-compose.override.yml
 # Edit docker-compose.override.yml to set your network name
 docker compose up -d --build
 
-# Option B: connect manually
+# Option B: connect manually to router's network
 docker network connect YOUR_NETWORK agentrouter-proxy
 ```
 
-Then configure the router to use `http://agentrouter-proxy:8318` as the upstream URL. The proxy is reachable by container name via Docker DNS.
+If running raw Node.js or PM2 on the host, use `http://host.docker.internal:8318` from the router container, or the host's LAN IP.
 
-### With opencode
+Configure the router to use `http://agentrouter-proxy:8318` as the upstream URL (Docker DNS) or `http://HOST_IP:8318` for host-mode.
 
-Add a provider to your `opencode.jsonc`:
+### With opencode / Claude Code / Cursor
+
+Add a provider to your `opencode.jsonc` or equivalent:
 
 ```jsonc
 "provider": {
-  "your-provider-name": {
+  "agentrouter": {
     "npm": "@ai-sdk/openai-compatible",
     "name": "AgentRouter",
     "options": {
@@ -139,7 +243,28 @@ Add a provider to your `opencode.jsonc`:
 }
 ```
 
-If opencode is on a different machine, replace `localhost` with the host's LAN IP.
+If the tool is on a different machine, replace `localhost` with the host's LAN IP. If routing through 9Router/LiteLLM, point `baseURL` at the router instead.
+
+---
+
+## Prompt Injection
+
+Set `INJECT_SYSTEM_PROMPT` in `.env` to inject a system prompt into every proxied request:
+
+```bash
+INJECT_SYSTEM_PROMPT=Your system prompt here
+```
+
+| Format | Path | Injection target |
+|--------|------|-----------------|
+| Anthropic | `/v1/messages` | `system` field (string or content block array) |
+| OpenAI | `/v1/chat/completions` | System message prepended to `messages` array |
+
+Restart the proxy after changing the variable (Docker: `docker compose up -d --build`, PM2: `pm2 restart`, systemd: `systemctl --user restart`).
+
+> **Note:** The upstream (agentrouter.org) enforces its own server-side content policies. The injected prompt may not bypass upstream filtering.
+
+---
 
 ## Model Auto-Discovery
 
@@ -153,28 +278,7 @@ The proxy queries `agentrouter.org/v1/models` on startup and every 10 minutes. T
 
 Without `AR_API_KEY`, the static `MODELS_CSV` list is used. Unknown model IDs in requests are always forwarded as-is.
 
-## Prompt Injection
-
-Set `INJECT_SYSTEM_PROMPT` in your `.env` to inject a system prompt into every proxied request:
-
-```bash
-INJECT_SYSTEM_PROMPT=Your system prompt here
-```
-
-The prompt is injected differently depending on the API format:
-
-| Format | Path | Injection target |
-|--------|------|-----------------|
-| Anthropic | `/v1/messages` | `system` field (string or content block array) |
-| OpenAI | `/v1/chat/completions` | System message prepended to `messages` array |
-
-Recreate the container after changing the variable:
-
-```bash
-docker compose up -d --build
-```
-
-> **Note:** The upstream (agentrouter.org) enforces its own server-side content policies. The injected prompt may not bypass upstream filtering.
+---
 
 ## Model Reference
 
@@ -187,13 +291,17 @@ docker compose up -d --build
 
 Opus 4.8 uses ~35% fewer output tokens than 4.7 at the same effort level.
 
-## Running Tests
+---
 
-Tests use Node.js 22+ built-in test runner (zero dependencies):
+## Running Tests
 
 ```bash
 node --test tests/proxy.test.mjs
 ```
+
+28 tests covering: health, models, path rewriting, header injection, SSE streaming, error handling, WAF retry, circuit breaker, prompt injection, concurrent streams, client disconnect, hop-by-hop filtering.
+
+---
 
 ## Known Limitations
 
@@ -204,6 +312,18 @@ node --test tests/proxy.test.mjs
 | Alibaba ALB 503 | Transient WAF issue | Proxy retry handles it |
 | `gpt-5.5` always 403 | Insufficient upstream quota | Omit from config |
 | `glm-5.2` 429 | TPM rate limit | Wait and retry |
+
+---
+
+## Logic Updates
+
+After making code changes, restart the proxy using your chosen method:
+- **Docker:** `docker compose up -d --build`
+- **Direct Node.js:** Ctrl+C then `node proxy.mjs`
+- **PM2:** `pm2 restart agentrouter-proxy`
+- **systemd:** `systemctl --user restart agentrouter-proxy`
+
+---
 
 ## License
 
