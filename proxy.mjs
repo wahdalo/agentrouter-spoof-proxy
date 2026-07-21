@@ -1,5 +1,7 @@
 import http from "node:http";
 import https from "node:https";
+import net from "node:net";
+import tls from "node:tls";
 import { resolve4 } from "node:dns/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 
@@ -21,6 +23,8 @@ const {
   RESPONSE_TIMEOUT_MS = "30000",
   LOG_LEVEL = "info",
 } = process.env;
+
+const HTTPS_PROXY = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "";
 
 const PORT = parseInt(LISTEN_PORT, 10);
 const TARGET_PORT_INT = parseInt(TARGET_PORT, 10);
@@ -44,13 +48,106 @@ const SSE_EOM = "event: message_stop";
 
 const UPSTREAM_MODULE = TARGET_PROTOCOL === "http" ? http : https;
 
-const AGENT = new UPSTREAM_MODULE.Agent({
-  keepAlive: true,
-  keepAliveMsecs: 1000,
-  maxSockets: 64,
-  maxFreeSockets: 16,
-  scheduling: "lifo",
-});
+// ── Upstream proxy agent (Webshare etc.) — zero-dependency HTTP CONNECT tunnel ──
+function parseProxyUrl(raw) {
+  try {
+    const u = new URL(raw);
+    return {
+      host: u.hostname,
+      port: parseInt(u.port, 10) || (u.protocol === "https:" ? 443 : 80),
+      secure: u.protocol === "https:",
+      auth: u.username ? `${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}` : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+const PROXY_CONFIG = HTTPS_PROXY ? parseProxyUrl(HTTPS_PROXY) : null;
+
+class TunnelAgent extends https.Agent {
+  constructor(proxy, options) {
+    super(options);
+    this.proxy = proxy;
+  }
+
+  createConnection(opts, cb) {
+    const { proxy } = this;
+    const targetHost = opts.host;
+    const targetPort = opts.port;
+
+    const connectProxy = proxy.secure
+      ? tls.connect({ host: proxy.host, port: proxy.port, servername: proxy.host })
+      : net.connect({ host: proxy.host, port: proxy.port });
+
+    let settled = false;
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      connectProxy.destroy();
+      cb(err);
+    };
+
+    connectProxy.once("error", fail);
+    connectProxy.once("timeout", () => fail(new Error("proxy connect timeout")));
+
+    connectProxy.once(proxy.secure ? "secureConnect" : "connect", () => {
+      const headers = [
+        `CONNECT ${targetHost}:${targetPort} HTTP/1.1`,
+        `Host: ${targetHost}:${targetPort}`,
+      ];
+      if (proxy.auth) {
+        headers.push(`Proxy-Authorization: Basic ${Buffer.from(proxy.auth).toString("base64")}`);
+      }
+      connectProxy.write(headers.join("\r\n") + "\r\n\r\n");
+
+      let buf = Buffer.alloc(0);
+      const onData = (chunk) => {
+        buf = Buffer.concat([buf, chunk]);
+        const idx = buf.indexOf("\r\n\r\n");
+        if (idx === -1) return;
+        connectProxy.removeListener("data", onData);
+        const statusLine = buf.slice(0, buf.indexOf("\r\n")).toString("utf8");
+        const statusCode = parseInt(statusLine.split(" ")[1], 10);
+        if (statusCode !== 200) {
+          fail(new Error(`proxy CONNECT failed: ${statusLine}`));
+          return;
+        }
+        connectProxy.removeListener("error", fail);
+        const tlsSocket = tls.connect({
+          socket: connectProxy,
+          servername: targetHost,
+          rejectUnauthorized: opts.rejectUnauthorized !== false,
+        });
+        tlsSocket.once("error", (err) => { if (!settled) { settled = true; cb(err); } });
+        tlsSocket.once("secureConnect", () => {
+          if (settled) return;
+          settled = true;
+          cb(null, tlsSocket);
+        });
+      };
+      connectProxy.on("data", onData);
+    });
+
+    return undefined;
+  }
+}
+
+const PROXY_AGENT = PROXY_CONFIG
+  ? new TunnelAgent(PROXY_CONFIG, { keepAlive: true, keepAliveMsecs: 1000, maxSockets: 64, maxFreeSockets: 16 })
+  : null;
+if (PROXY_AGENT) {
+  console.log(`Using upstream HTTP proxy ${PROXY_CONFIG.host}:${PROXY_CONFIG.port} via CONNECT tunnel`);
+}
+
+const AGENT = PROXY_AGENT
+  || new UPSTREAM_MODULE.Agent({
+      keepAlive: true,
+      keepAliveMsecs: 1000,
+      maxSockets: 64,
+      maxFreeSockets: 16,
+      scheduling: "lifo",
+    });
 
 let activeStreams = 0;
 
@@ -184,23 +281,21 @@ async function warmup() {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const cookie = await new Promise((resolve, reject) => {
-        const req = UPSTREAM_MODULE.request(
-          {
-            hostname: TARGET_HOST,
-            port: TARGET_PORT_INT,
-            path: "/",
-            method: "GET",
-            headers: WARMUP_HEADERS,
-            agent: false,
-            rejectUnauthorized: true,
-            timeout: 10000,
-          },
-          (res) => {
-            const waf = extractWafCookies(res);
-            res.resume();
-            res.on("end", () => resolve(waf));
-          }
-        );
+        const reqOpts = {
+          hostname: TARGET_HOST,
+          port: TARGET_PORT_INT,
+          path: "/",
+          method: "GET",
+          headers: WARMUP_HEADERS,
+          agent: PROXY_AGENT || false,
+          rejectUnauthorized: true,
+          timeout: 10000,
+        };
+        const req = UPSTREAM_MODULE.request(reqOpts, (res) => {
+          const waf = extractWafCookies(res);
+          res.resume();
+          res.on("end", () => resolve(waf));
+        });
         req.on("error", reject);
         req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
         req.end();
@@ -308,9 +403,10 @@ function respondJson(res, status, data) {
 }
 
 function isWafBlock(statusCode, body) {
-  if (statusCode !== 405 && statusCode !== 403) return false;
-  const html = typeof body === "string" ? body : body.toString("utf8");
-  return html.includes("alicdn") || html.includes("block_message") || html.includes("renderData");
+  // Also detect WAF at 200: agentrouter.org returns WAF captcha with HTTP 200
+  if (statusCode !== 405 && statusCode !== 403 && statusCode !== 200) return false;
+  const html = typeof body === "string" ? body : Buffer.isBuffer(body) ? body.toString("utf8", 0, Math.min(body.length, 2000)) : body.toString("utf8");
+  return html.includes("alicdn") || html.includes("block_message") || html.includes("renderData") || html.includes("aliyun_waf");
 }
 
 function isRetryable(statusCode, errorMessage) {
@@ -394,7 +490,7 @@ const server = http.createServer((req, res) => {
     const upstreamHeaders = {
       ...SPOOF_HEADERS,
       "Content-Type": "application/json",
-      ...(req.headers["authorization"] ? { Authorization: req.headers["authorization"] } : {}),
+      ...(AR_API_KEY ? { Authorization: `Bearer ${AR_API_KEY}` } : req.headers["authorization"] ? { Authorization: req.headers["authorization"] } : {}),
       ...(req.headers["x-api-key"] ? { "x-api-key": req.headers["x-api-key"] } : {}),
       ...(req.headers["anthropic-version"] ? { "anthropic-version": req.headers["anthropic-version"] } : {}),
     };
@@ -437,6 +533,7 @@ const server = http.createServer((req, res) => {
         let keepaliveTimer = null; // client keepalive ping injector
         let isSse = false;
         let sawMessageStop = false;
+        let sawContent = false;
         let upstreamResponded = false;
 
         function clearIdleTimer() {
@@ -462,7 +559,7 @@ const server = http.createServer((req, res) => {
                 log(ts, `WAF ${statusCode} detected, refreshing cookie and retrying...`);
                 await warmup();
                 if (wafCookieStr) upstreamHeaders["Cookie"] = wafCookieStr;
-                finishProxy(); // decrement activeStreams before retry
+                activeStreams--; // balance the ++ in the retry
                 const result = await doRequest(attempt + 1);
                 resolveProxy(result);
                 return;
@@ -484,7 +581,7 @@ const server = http.createServer((req, res) => {
             errorHandled = true; // prevent concurrent timeout/error retry
             log(ts, `${method} ${rawPath} <- ${statusCode}, retrying (${attempt + 1}/${MAX_RETRIES_NUM})...`);
             const delay = RETRY_DELAY * Math.pow(2, attempt);
-            finishProxy(); // decrement activeStreams before retry
+            activeStreams--; // balance the ++ in the retry
             setTimeout(async () => {
               const result = await doRequest(attempt + 1);
               resolveProxy(result);
@@ -540,6 +637,30 @@ const server = http.createServer((req, res) => {
             clearIdleTimer();
             finishProxy();
             resolveProxy();
+          }
+
+          // Detect WAF HTML captcha masquerading as 200
+          const ct = (upstreamRes.headers["content-type"] || "").toLowerCase();
+          if (!isSse && ct.includes("text/html") && attempt < MAX_RETRIES_NUM) {
+            let chunks = [];
+            upstreamRes.on("data", (c) => chunks.push(c));
+            upstreamRes.on("end", async () => {
+              const raw = Buffer.concat(chunks);
+              if (isWafBlock(200, raw)) {
+                log(ts, `WAF html captcha detected at 200, re-warming and retrying...`);
+                await warmup();
+                if (wafCookieStr) upstreamHeaders["Cookie"] = wafCookieStr;
+                activeStreams--; // balance the ++ in the retry
+                const result = await doRequest(attempt + 1);
+                resolveProxy(result);
+                return;
+              }
+              // Not WAF — send buffered response
+              if (!safeWriteHead(200, filteredHeaders)) { finishStream(); return; }
+              safeEnd(raw);
+              finishStream();
+            });
+            return;
           }
 
           if (!safeWriteHead(200, filteredHeaders)) {
@@ -612,10 +733,21 @@ const server = http.createServer((req, res) => {
             if (streamFinished) return;
             resetIdleTimer();
             resetChunkTimer();
+            // Filter out AgentRouter billing summary objects (only if content already seen)
+            if (sawContent) {
+              const chunkStr = chunk.toString("utf8");
+              if (chunkStr.includes("billing.summary") || (chunkStr.includes('"billing"') && chunkStr.includes('"cost_cny"'))) {
+                logDebug(ts, `${method} ${rawPath} <- FILTERED billing summary chunk (${chunk.length}b)`);
+                return;
+              }
+            }
             chunkCount++;
             maxChunkSize = Math.max(maxChunkSize, chunk.length);
             logDebug(ts, `${method} ${rawPath} <- CHUNK #${chunkCount} ${chunk.length}b, elapsed ${Date.now() - reqStart}ms`);
-            if (chunk.length > KEEPALIVE_THRESHOLD) sawDataEvent = true;
+            if (chunk.length > KEEPALIVE_THRESHOLD) {
+              sawDataEvent = true;
+              sawContent = true;
+            }
             if (chunk.includes(SSE_EOM)) sawMessageStop = true;
             const canContinue = safeWrite(chunk);
             if (canContinue === false && !res.writableEnded) {
