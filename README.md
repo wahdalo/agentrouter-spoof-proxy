@@ -335,7 +335,7 @@ node --test tests/proxy.test.mjs
 | `NoChannelError` (503) | No available upstream channel | Retry or switch model |
 | `content-blocked` (400) | Upstream content moderation | Rephrase request |
 | Alibaba ALB 503 | Transient WAF issue | Proxy retry handles it |
-| `gpt-5.5` always 403 | Insufficient upstream quota | Omit from config |
+| `gpt-5.5` intermittent 403 | Upstream quota/channel fluctuates | Retry, or omit from config if persistent |
 | `glm-5.2` 429 | TPM rate limit | Wait and retry |
 
 ---

@@ -331,6 +331,6 @@ Restart (see Step 8 for commands). Health endpoint shows `modelSource: "dynamic"
 
 - All Claude Opus models: 1M context, 128k output, vision, reasoning, tool calls
 - GLM-5.2: 1M context, 131k output, reasoning, tool calls (vision untested)
-- `gpt-5.5` always returns 403 (upstream quota)
+- `gpt-5.5` availability fluctuates — may return 403 (upstream quota/channel) or work normally; retry before disabling
 - `NoChannelError` (503) is normal — upstream channels fluctuate
 - Opus 4.8 uses ~35% fewer output tokens than 4.7 at same effort level
