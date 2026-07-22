@@ -168,6 +168,8 @@ Copy `.env.example` to `.env` and edit as needed. All settings have sensible def
 | `AR_API_KEY` | _(empty)_ | AgentRouter API key for auto model discovery |
 | `DISCOVERY_INTERVAL_MS` | `600000` | Model list refresh interval (ms) |
 | `INJECT_SYSTEM_PROMPT` | _(empty)_ | System prompt injected into every request (empty = disabled) |
+| `FILTER_BILLING` | `true` | Strip AgentRouter `billing`/`cost_cny` summary from responses (`false` to keep it) |
+| `HTTPS_PROXY` / `HTTP_PROXY` | _(empty)_ | Route upstream traffic through an HTTP proxy (e.g. Webshare) via CONNECT tunnel |
 | `LOG_LEVEL` | `info` | `info` or `debug` |
 
 ---
@@ -263,6 +265,29 @@ INJECT_SYSTEM_PROMPT=Your system prompt here
 Restart the proxy after changing the variable (Docker: `docker compose up -d --build`, PM2: `pm2 restart`, systemd: `systemctl --user restart`).
 
 > **Note:** The upstream (agentrouter.org) enforces its own server-side content policies. The injected prompt may not bypass upstream filtering.
+
+---
+
+## Billing Summary Filtering
+
+AgentRouter appends a non-standard `billing` summary object (containing `cost_cny`, the upstream cost in Chinese Yuan) to every response. By default the proxy strips it so responses conform to the standard Anthropic/OpenAI shape and upstream cost details are not leaked to clients.
+
+- **Streaming (SSE):** billing `data:` events are dropped event-by-event, resilient to events split across TCP chunks.
+- **Non-streaming (JSON):** the response body is buffered, the `billing` property is removed recursively, and `Content-Length` is recalculated before sending.
+
+Set `FILTER_BILLING=false` in `.env` to pass the billing summary through unchanged (useful for cost monitoring). Enable `LOG_LEVEL=debug` to see `FILTERED billing` log lines.
+
+---
+
+## Upstream HTTP Proxy
+
+Set `HTTPS_PROXY` (or `HTTP_PROXY`) in `.env` to route all upstream traffic — including WAF cookie warmup — through an HTTP proxy such as Webshare:
+
+```bash
+HTTPS_PROXY=http://user:pass@proxy-host:port
+```
+
+The proxy uses a zero-dependency HTTP `CONNECT` tunnel (built on Node core `net`/`tls`), so no extra packages are required. Basic auth credentials in the URL are supported.
 
 ---
 

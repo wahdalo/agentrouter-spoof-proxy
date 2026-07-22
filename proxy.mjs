@@ -22,6 +22,7 @@ const {
   SSE_CHUNK_TIMEOUT_MS = "30000",
   RESPONSE_TIMEOUT_MS = "30000",
   LOG_LEVEL = "info",
+  FILTER_BILLING = "true",
 } = process.env;
 
 const HTTPS_PROXY = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || "";
@@ -37,6 +38,7 @@ const SSE_IDLE = parseInt(SSE_IDLE_TIMEOUT_MS, 10);
 const SSE_CHUNK_TIMEOUT = parseInt(SSE_CHUNK_TIMEOUT_MS, 10);
 const RESPONSE_TIMEOUT = parseInt(RESPONSE_TIMEOUT_MS, 10);
 const IS_DEBUG = LOG_LEVEL === "debug";
+const FILTER_BILLING_ENABLED = String(FILTER_BILLING).toLowerCase() !== "false";
 
 const HOP_BY_HOP = new Set([
   "transfer-encoding", "connection", "keep-alive",
@@ -416,6 +418,89 @@ function isRetryable(statusCode, errorMessage) {
   return false;
 }
 
+// ── Billing summary filtering (AgentRouter injects `billing`/`cost_cny`) ──
+
+function stripBillingFromObject(obj) {
+  if (!obj || typeof obj !== "object") return obj;
+  if (Array.isArray(obj)) {
+    for (const item of obj) stripBillingFromObject(item);
+    return obj;
+  }
+  if ("billing" in obj) delete obj.billing;
+  for (const key of Object.keys(obj)) {
+    const val = obj[key];
+    if (val && typeof val === "object") stripBillingFromObject(val);
+  }
+  return obj;
+}
+
+function stripBillingFromJsonBuffer(raw) {
+  const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw);
+  if (!text.includes('"billing"') && !text.includes("cost_cny")) return null;
+  try {
+    const parsed = JSON.parse(text);
+    stripBillingFromObject(parsed);
+    return Buffer.from(JSON.stringify(parsed), "utf8");
+  } catch {
+    return null;
+  }
+}
+
+function isBillingSseEvent(eventText) {
+  if (!eventText.includes('"billing"') && !eventText.includes("cost_cny") && !eventText.includes("billing.summary")) {
+    return false;
+  }
+  for (const rawLine of eventText.split("\n")) {
+    const line = rawLine.trimStart();
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+    try {
+      const obj = JSON.parse(payload);
+      const type = obj && typeof obj === "object" ? obj.type : "";
+      if (type === "billing.summary") return true;
+      if (obj && typeof obj === "object" && obj.billing && !("content_block" in obj) && !("delta" in obj)) {
+        return true;
+      }
+    } catch {
+      if (payload.includes("billing.summary")) return true;
+      if (payload.includes('"billing"') && payload.includes("cost_cny")) return true;
+    }
+  }
+  return false;
+}
+
+function createBillingSseFilter(onFiltered) {
+  let buffer = "";
+  return {
+    push(chunk) {
+      buffer += chunk.toString("utf8");
+      let out = "";
+      let idx;
+      while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        const event = buffer.slice(0, idx + 2);
+        buffer = buffer.slice(idx + 2);
+        if (isBillingSseEvent(event)) {
+          if (onFiltered) onFiltered(Buffer.byteLength(event, "utf8"));
+          continue;
+        }
+        out += event;
+      }
+      return out ? Buffer.from(out, "utf8") : null;
+    },
+    flush() {
+      if (!buffer) return null;
+      const tail = buffer;
+      buffer = "";
+      if (isBillingSseEvent(tail)) {
+        if (onFiltered) onFiltered(Buffer.byteLength(tail, "utf8"));
+        return null;
+      }
+      return Buffer.from(tail, "utf8");
+    },
+  };
+}
+
 // ── SSE idle timeout (default 10 min no data = hung stream) ──
 
 // ── Server ──
@@ -533,7 +618,6 @@ const server = http.createServer((req, res) => {
         let keepaliveTimer = null; // client keepalive ping injector
         let isSse = false;
         let sawMessageStop = false;
-        let sawContent = false;
         let upstreamResponded = false;
 
         function clearIdleTimer() {
@@ -663,6 +747,44 @@ const server = http.createServer((req, res) => {
             return;
           }
 
+          // Non-streaming body: buffer, strip AgentRouter `billing` summary, then send.
+          // Upstream returns JSON with content-type text/plain, so match both. HTML is
+          // handled above (WAF), SSE is streamed below.
+          if (!isSse && FILTER_BILLING_ENABLED && !ct.includes("text/html") &&
+              (ct.includes("application/json") || ct.includes("text/plain") || ct === "")) {
+            logDebug(ts, `${method} ${rawPath} <- buffering non-stream body (ct="${ct}")`);
+            const jsonChunks = [];
+            upstreamRes.on("data", (c) => jsonChunks.push(c));
+            upstreamRes.on("end", () => {
+              const raw = Buffer.concat(jsonChunks);
+              let outBody = raw;
+              const stripped = stripBillingFromJsonBuffer(raw);
+              if (stripped) {
+                outBody = stripped;
+                logDebug(ts, `${method} ${rawPath} <- FILTERED billing from JSON body (${raw.length}b -> ${outBody.length}b)`);
+              }
+              // Drop content-length; let Node derive it from the (possibly rewritten) body
+              const outHeaders = { ...filteredHeaders };
+              for (const k of Object.keys(outHeaders)) {
+                if (k.toLowerCase() === "content-length") delete outHeaders[k];
+              }
+              if (!safeWriteHead(200, outHeaders)) { finishStream(); return; }
+              safeEnd(outBody);
+              log(ts, `${method} ${rawPath} <- 200 (buffered, ${Date.now() - reqStart}ms, ${outBody.length}b)`);
+              finishStream();
+            });
+            upstreamRes.on("error", (e) => {
+              log(ts, `${method} ${rawPath} <- UPSTREAM BODY ERROR: ${e.message}`);
+              safeEnd();
+              finishStream();
+            });
+            upstreamRes.on("close", () => {
+              if (!res.writableEnded) { safeEnd(); }
+              finishStream();
+            });
+            return;
+          }
+
           if (!safeWriteHead(200, filteredHeaders)) {
             upstreamRes.resume();
             finishStream();
@@ -729,26 +851,13 @@ const server = http.createServer((req, res) => {
           resetChunkTimer();
           if (isSse) startKeepalive();
 
-          upstreamRes.on("data", (chunk) => {
-            if (streamFinished) return;
-            resetIdleTimer();
-            resetChunkTimer();
-            // Filter out AgentRouter billing summary objects (only if content already seen)
-            if (sawContent) {
-              const chunkStr = chunk.toString("utf8");
-              if (chunkStr.includes("billing.summary") || (chunkStr.includes('"billing"') && chunkStr.includes('"cost_cny"'))) {
-                logDebug(ts, `${method} ${rawPath} <- FILTERED billing summary chunk (${chunk.length}b)`);
-                return;
-              }
-            }
-            chunkCount++;
-            maxChunkSize = Math.max(maxChunkSize, chunk.length);
-            logDebug(ts, `${method} ${rawPath} <- CHUNK #${chunkCount} ${chunk.length}b, elapsed ${Date.now() - reqStart}ms`);
-            if (chunk.length > KEEPALIVE_THRESHOLD) {
-              sawDataEvent = true;
-              sawContent = true;
-            }
-            if (chunk.includes(SSE_EOM)) sawMessageStop = true;
+          // Stateful SSE billing filter: drops billing.summary events even when
+          // split across TCP chunks (event-aware, not raw substring matching).
+          const sseBillingFilter = (isSse && FILTER_BILLING_ENABLED)
+            ? createBillingSseFilter((bytes) => logDebug(ts, `${method} ${rawPath} <- FILTERED billing SSE event (${bytes}b)`))
+            : null;
+
+          function writeToClient(chunk) {
             const canContinue = safeWrite(chunk);
             if (canContinue === false && !res.writableEnded) {
               if (res.socket?.destroyed || res.destroyed) {
@@ -759,10 +868,34 @@ const server = http.createServer((req, res) => {
                 res.once("drain", () => { if (!streamFinished) upstreamRes.resume(); });
               }
             }
+          }
+
+          upstreamRes.on("data", (chunk) => {
+            if (streamFinished) return;
+            resetIdleTimer();
+            resetChunkTimer();
+            chunkCount++;
+            maxChunkSize = Math.max(maxChunkSize, chunk.length);
+            logDebug(ts, `${method} ${rawPath} <- CHUNK #${chunkCount} ${chunk.length}b, elapsed ${Date.now() - reqStart}ms`);
+            if (chunk.length > KEEPALIVE_THRESHOLD) {
+              sawDataEvent = true;
+            }
+            if (chunk.includes(SSE_EOM)) sawMessageStop = true;
+
+            if (sseBillingFilter) {
+              const filtered = sseBillingFilter.push(chunk);
+              if (filtered) writeToClient(filtered);
+              return;
+            }
+            writeToClient(chunk);
           });
 
           upstreamRes.on("end", () => {
             if (streamFinished) return;
+            if (sseBillingFilter) {
+              const tail = sseBillingFilter.flush();
+              if (tail) writeToClient(tail);
+            }
             if (isSse && !sawDataEvent) {
               log(ts, `${method} ${rawPath} <- EMPTY SSE STREAM (${chunkCount} chunks, max ${maxChunkSize}b)`);
             }

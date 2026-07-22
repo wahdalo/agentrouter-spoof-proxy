@@ -324,6 +324,8 @@ Restart (see Step 8 for commands). Health endpoint shows `modelSource: "dynamic"
 | `AR_API_KEY` | _(empty)_ | API key for model discovery |
 | `DISCOVERY_INTERVAL_MS` | `600000` | Model list refresh (ms) |
 | `INJECT_SYSTEM_PROMPT` | _(empty)_ | System prompt injected into every request (empty = disabled) |
+| `FILTER_BILLING` | `true` | Strip AgentRouter `billing`/`cost_cny` summary from responses (`false` to keep it) |
+| `HTTPS_PROXY` / `HTTP_PROXY` | _(empty)_ | Route upstream traffic through an HTTP proxy via CONNECT tunnel |
 
 ## Model Notes
 
