@@ -661,7 +661,8 @@ const server = http.createServer((req, res) => {
                 log(ts, `WAF ${statusCode} detected, refreshing cookie and retrying...`);
                 await warmup();
                 if (wafCookieStr) upstreamHeaders["Cookie"] = wafCookieStr;
-                activeStreams--; // balance the ++ in the retry
+                // NOTE: do NOT decrement activeStreams here — doRequest() does not
+                // re-increment on retry, so only finishProxy() should decrement (once).
                 const result = await doRequest(attempt + 1);
                 resolveProxy(result);
                 return;
@@ -683,7 +684,8 @@ const server = http.createServer((req, res) => {
             errorHandled = true; // prevent concurrent timeout/error retry
             log(ts, `${method} ${rawPath} <- ${statusCode}, retrying (${attempt + 1}/${MAX_RETRIES_NUM})...`);
             const delay = RETRY_DELAY * Math.pow(2, attempt);
-            activeStreams--; // balance the ++ in the retry
+            // NOTE: do NOT decrement activeStreams here — doRequest() does not
+            // re-increment on retry, so only finishProxy() should decrement (once).
             setTimeout(async () => {
               const result = await doRequest(attempt + 1);
               resolveProxy(result);
@@ -752,7 +754,8 @@ const server = http.createServer((req, res) => {
                 log(ts, `WAF html captcha detected at 200, re-warming and retrying...`);
                 await warmup();
                 if (wafCookieStr) upstreamHeaders["Cookie"] = wafCookieStr;
-                activeStreams--; // balance the ++ in the retry
+                // NOTE: do NOT decrement activeStreams here — doRequest() does not
+                // re-increment on retry, so only finishProxy() should decrement (once).
                 const result = await doRequest(attempt + 1);
                 resolveProxy(result);
                 return;
