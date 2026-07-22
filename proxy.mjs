@@ -459,7 +459,14 @@ function isBillingSseEvent(eventText) {
       const obj = JSON.parse(payload);
       const type = obj && typeof obj === "object" ? obj.type : "";
       if (type === "billing.summary") return true;
-      if (obj && typeof obj === "object" && obj.billing && !("content_block" in obj) && !("delta" in obj)) {
+      // Standard Anthropic SSE event types that must never be dropped even if
+      // they happen to carry a `billing`-like field.
+      const PROTECTED_TYPES = new Set([
+        "message_start", "message_delta", "message_stop",
+        "content_block_start", "content_block_delta", "content_block_stop",
+        "ping", "error",
+      ]);
+      if (obj && typeof obj === "object" && obj.billing && !PROTECTED_TYPES.has(type)) {
         return true;
       }
     } catch {
@@ -471,10 +478,15 @@ function isBillingSseEvent(eventText) {
 }
 
 function createBillingSseFilter(onFiltered) {
+  // Cap the reassembly buffer so a pathological event without a delimiter can't
+  // grow memory unbounded. If exceeded, flush the raw buffer through unfiltered.
+  const MAX_BUFFER = 1024 * 1024; // 1 MB
   let buffer = "";
   return {
     push(chunk) {
-      buffer += chunk.toString("utf8");
+      // Normalize CRLF to LF so event boundaries are detected regardless of the
+      // upstream's line endings (SSE permits both "\n\n" and "\r\n\r\n").
+      buffer += chunk.toString("utf8").replace(/\r\n/g, "\n");
       let out = "";
       let idx;
       while ((idx = buffer.indexOf("\n\n")) !== -1) {
@@ -485,6 +497,12 @@ function createBillingSseFilter(onFiltered) {
           continue;
         }
         out += event;
+      }
+      if (buffer.length > MAX_BUFFER) {
+        // No delimiter found within the cap: pass the accumulated data through
+        // unfiltered rather than holding it in memory indefinitely.
+        out += buffer;
+        buffer = "";
       }
       return out ? Buffer.from(out, "utf8") : null;
     },
@@ -753,9 +771,41 @@ const server = http.createServer((req, res) => {
           if (!isSse && FILTER_BILLING_ENABLED && !ct.includes("text/html") &&
               (ct.includes("application/json") || ct.includes("text/plain") || ct === "")) {
             logDebug(ts, `${method} ${rawPath} <- buffering non-stream body (ct="${ct}")`);
+            const MAX_BODY = 10 * 1024 * 1024; // 10 MB cap on in-memory buffering
             const jsonChunks = [];
-            upstreamRes.on("data", (c) => jsonChunks.push(c));
+            let bufferedLen = 0;
+            let overflowed = false;
+            upstreamRes.on("data", (c) => {
+              if (overflowed) { writeToClientRaw(c); return; }
+              bufferedLen += c.length;
+              if (bufferedLen > MAX_BODY) {
+                // Too large to buffer/filter safely: send headers, flush what we
+                // have, and stream the rest through unfiltered.
+                overflowed = true;
+                log(ts, `${method} ${rawPath} <- body exceeds ${MAX_BODY}b, streaming unfiltered`);
+                if (!safeWriteHead(200, filteredHeaders)) { upstreamRes.resume(); finishStream(); return; }
+                for (const b of jsonChunks) safeWrite(b);
+                jsonChunks.length = 0;
+                safeWrite(c);
+                return;
+              }
+              jsonChunks.push(c);
+            });
+            function writeToClientRaw(c) {
+              const canContinue = safeWrite(c);
+              if (canContinue === false && !res.writableEnded && !(res.socket?.destroyed || res.destroyed)) {
+                upstreamRes.pause();
+                res.once("drain", () => { if (!streamFinished) upstreamRes.resume(); });
+              }
+            }
             upstreamRes.on("end", () => {
+              if (streamFinished) return;
+              if (overflowed) {
+                safeEnd();
+                log(ts, `${method} ${rawPath} <- 200 (streamed unfiltered, ${Date.now() - reqStart}ms)`);
+                finishStream();
+                return;
+              }
               const raw = Buffer.concat(jsonChunks);
               let outBody = raw;
               const stripped = stripBillingFromJsonBuffer(raw);
