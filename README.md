@@ -60,7 +60,7 @@ git clone https://github.com/trefeon/agentrouter-spoof-proxy.git
 cd agentrouter-spoof-proxy
 cp .env.example .env
 # edit .env if needed
-node proxy.mjs
+node --env-file=.env proxy.mjs
 ```
 
 ### Option C — Docker (raw, no compose)
@@ -89,7 +89,7 @@ git clone https://github.com/trefeon/agentrouter-spoof-proxy.git
 cd agentrouter-spoof-proxy
 cp .env.example .env
 npm install -g pm2           # if not installed
-pm2 start proxy.mjs --name agentrouter-proxy
+pm2 start proxy.mjs --name agentrouter-proxy --node-args="--env-file=.env"
 pm2 save                     # save process list
 pm2 startup                  # auto-restart on boot
 ```
@@ -115,7 +115,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/node /path/to/agentrouter-spoof-proxy/proxy.mjs
+ExecStart=/usr/bin/node --env-file=.env /path/to/agentrouter-spoof-proxy/proxy.mjs
 Restart=always
 RestartSec=5
 WorkingDirectory=/path/to/agentrouter-spoof-proxy
@@ -344,7 +344,7 @@ node --test tests/proxy.test.mjs
 
 After making code changes, restart the proxy using your chosen method:
 - **Docker:** `docker compose up -d --build`
-- **Direct Node.js:** Ctrl+C then `node proxy.mjs`
+- **Direct Node.js:** Ctrl+C then `node --env-file=.env proxy.mjs`
 - **PM2:** `pm2 restart agentrouter-proxy`
 - **systemd:** `systemctl --user restart agentrouter-proxy`
 
